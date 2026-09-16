@@ -62,17 +62,22 @@ pub async fn run(config: Config) -> Result<()> {
     )
     .await?;
 
+    let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    connector.enforce_http(false);
+    connector.set_nodelay(true);
+    connector.set_keepalive(Some(Duration::from_secs(60)));
     let https = HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_or_http()
         .enable_http1()
         .enable_http2()
-        .build();
+        .wrap_connector(connector);
     let client: HttpClient = Client::builder(TokioExecutor::new())
         .pool_timer(TokioTimer::new())
         .timer(TokioTimer::new())
         .pool_idle_timeout(Some(Duration::from_secs(90)))
         .pool_max_idle_per_host(64)
+        .http2_adaptive_window(true)
         .http2_keep_alive_interval(Some(Duration::from_secs(30)))
         .build(https);
 
@@ -119,6 +124,9 @@ pub async fn run(config: Config) -> Result<()> {
                         debug!("Error serving connection: {:?}", err);
                     }
                 });
+            }
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result { debug!(?error, "connection task failed"); }
             }
             _ = &mut shutdown_signal => {
                 info!("Graceful shutdown signal received, stopping listener...");

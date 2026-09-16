@@ -12,18 +12,23 @@ use tokio::fs as tfs;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tracing::warn;
 
+#[cfg(test)]
+#[path = "upstream_tests.rs"]
+mod tests;
+
 pub type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
 
 pub const USER_AGENT: &str = concat!("YU-RI/", env!("CARGO_PKG_VERSION"));
 
 pub fn max_cacheable_body_bytes(config: &Config) -> usize {
-    config
-        .max_body_bytes
-        .unwrap_or(config.max_cache_size_bytes) as usize
+    config.max_body_bytes.unwrap_or(config.max_cache_size_bytes) as usize
 }
 
 fn header_str(headers: &HeaderMap, name: &header::HeaderName) -> Option<String> {
-    headers.get(name).and_then(|v| v.to_str().ok()).map(String::from)
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
 }
 
 pub(crate) fn store_options_from_headers(
@@ -206,10 +211,43 @@ pub async fn background_refresh(
     cache: &DiskCache,
     client: &HttpClient,
 ) -> Result<()> {
-    let upstream_req = build_upstream_request(http::Method::GET, cache_key.as_str(), None);
+    let current = cache.get_file(&cache_key).await.ok().flatten();
+    let mut upstream_req = build_upstream_request(http::Method::GET, cache_key.as_str(), None);
+    if let Some(entry) = &current {
+        for (name, value) in [
+            (header::IF_NONE_MATCH, entry.etag.as_deref()),
+            (header::IF_MODIFIED_SINCE, entry.last_modified.as_deref()),
+        ] {
+            if let Some(value) = value.and_then(|s| s.parse::<header::HeaderValue>().ok()) {
+                upstream_req.headers_mut().insert(name, value);
+            }
+        }
+    }
     let Ok(up_resp) = client.request(upstream_req).await else {
         return Ok(());
     };
+    let headers = up_resp.headers();
+    if headers.get_all(header::VARY).iter().any(|v| {
+        v.to_str()
+            .is_ok_and(|s| s.split(',').any(|part| part.trim() == "*"))
+    }) {
+        return Ok(());
+    }
+    if up_resp.status() == StatusCode::NOT_MODIFIED {
+        // Body unchanged: renew freshness in place from the 304 headers.
+        let decision = derive_ttl(up_resp.headers(), std::time::SystemTime::now());
+        if decision.cacheable
+            && let Some(expected) = &current
+        {
+            let mut options = store_options_from_headers(headers, &decision);
+            if headers.contains_key(header::CACHE_CONTROL) {
+                // A supplied policy replaces SWR; absent headers retain the old policy.
+                options.swr = Some(options.swr.unwrap_or(std::time::Duration::ZERO));
+            }
+            cache.revalidate(&cache_key, expected, options).await?;
+        }
+        return Ok(());
+    }
     if up_resp.status() != StatusCode::OK {
         return Ok(());
     }

@@ -29,24 +29,26 @@ pub fn derive_ttl(headers: &HeaderMap, now: SystemTime) -> TtlDecision {
         let mut s_maxage: Option<i64> = None;
         let mut swr: Option<i64> = None;
         for part in cc_val.split(',') {
-            let token = part.trim().to_ascii_lowercase();
-            if token == "no-store" || token == "no-cache" || token == "private" {
+            let token = part.trim();
+            if ["no-store", "no-cache", "private"]
+                .iter()
+                .any(|name| token.eq_ignore_ascii_case(name))
+            {
                 // "private" is treated as non-cacheable for a shared cache.
                 debug!(target: "http_cache", directive = token, "Cache-Control directive forces non-cacheable");
                 return NOT_CACHEABLE;
             }
-            if let Some(rest) = token.strip_prefix("s-maxage=") {
-                if let Ok(v) = rest.parse::<i64>() {
-                    s_maxage = Some(v.max(0));
-                }
-            } else if let Some(rest) = token.strip_prefix("max-age=") {
-                if let Ok(v) = rest.parse::<i64>() {
-                    max_age = Some(v.max(0));
-                }
-            } else if let Some(rest) = token.strip_prefix("stale-while-revalidate=")
-                && let Ok(v) = rest.parse::<i64>()
+            if let Some((name, value)) = token.split_once('=')
+                && let Ok(value) = value.parse::<i64>()
             {
-                swr = Some(v.max(0));
+                let value = Some(value.max(0));
+                if name.eq_ignore_ascii_case("s-maxage") {
+                    s_maxage = value;
+                } else if name.eq_ignore_ascii_case("max-age") {
+                    max_age = value;
+                } else if name.eq_ignore_ascii_case("stale-while-revalidate") {
+                    swr = value;
+                }
             }
         }
         let chosen = s_maxage.or(max_age);
@@ -112,6 +114,27 @@ mod tests {
     use super::*;
     use http::HeaderMap;
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn mixed_case_directives_keep_shared_ttl_precedence() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "Cache-Control",
+            "MAX-AGE=10, S-MaxAge=20, Stale-While-Revalidate=30"
+                .parse()
+                .unwrap(),
+        );
+        let decision = derive_ttl(&h, SystemTime::now());
+        assert_eq!(decision.ttl, Some(Duration::from_secs(20)));
+        assert_eq!(
+            decision.stale_while_revalidate,
+            Some(Duration::from_secs(30))
+        );
+        for directive in ["NO-STORE", "No-Cache", "Private"] {
+            h.insert("Cache-Control", directive.parse().unwrap());
+            assert!(!derive_ttl(&h, SystemTime::now()).cacheable);
+        }
+    }
 
     #[test]
     fn test_max_age() {

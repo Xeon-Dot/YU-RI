@@ -158,13 +158,16 @@ fn range_extra_headers(range: &ResolvedRange) -> Vec<(header::HeaderName, header
 }
 
 fn stream_file(path: PathBuf, start: u64, len: u64) -> BoxedBody {
-    const BUF_SIZE: usize = 128 * 1024;
+    // Larger reads, but bounded read-ahead: about 1 MiB queued per slow client.
+    const BUF_SIZE: usize = 256 * 1024;
     let (tx, body_stream) =
-        tokio::sync::mpsc::channel::<Result<hyper::body::Frame<Bytes>, hyper::Error>>(64);
+        tokio::sync::mpsc::channel::<Result<hyper::body::Frame<Bytes>, hyper::Error>>(4);
     tokio::spawn(async move {
         let result = async {
             let mut file = tfs::File::open(&path).await?;
-            file.seek(SeekFrom::Start(start)).await?;
+            if start != 0 {
+                file.seek(SeekFrom::Start(start)).await?;
+            }
             let mut reader = file.take(len);
             let mut buf = BytesMut::with_capacity(BUF_SIZE);
             loop {
@@ -187,4 +190,30 @@ fn stream_file(path: PathBuf, start: u64, len: u64) -> BoxedBody {
     });
     http_body_util::StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(body_stream))
         .boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn cached_stream_preserves_large_body_and_ranges() {
+        let root = std::env::temp_dir().join(format!("yu-ri-stream-{}", std::process::id()));
+        tfs::create_dir_all(&root).await.unwrap();
+        let path = root.join("data");
+        let data: Vec<u8> = (0..2_000_003).map(|n| (n % 251) as u8).collect();
+        tfs::write(&path, &data).await.unwrap();
+        let full = stream_file(path.clone(), 0, data.len() as u64)
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(full.as_ref(), data.as_slice());
+        let range = stream_file(path, 12345, 765432)
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(range.as_ref(), &data[12345..777777]);
+        tfs::remove_dir_all(root).await.unwrap();
+    }
 }

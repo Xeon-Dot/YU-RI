@@ -68,5 +68,3 @@ pub fn copy_upstream_headers(dst: &mut HeaderMap, src: &HeaderMap, include_vary:
         dst.insert(header::VARY, v.clone());
     }
 }
-
-

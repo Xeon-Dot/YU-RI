@@ -138,7 +138,13 @@ impl Config {
             .unwrap_or(req_path_and_query);
 
         for sub in &self.upstream_subs {
-            if path_only == sub.path || path_only.starts_with(&format!("{}/", sub.path)) {
+            // Allocation-free prefix match: `starts_with` plus boundary byte
+            // check replaces the per-request `format!("{}/", path)` allocation.
+            if path_only == sub.path
+                || (path_only.len() > sub.path.len()
+                    && path_only.starts_with(sub.path.as_str())
+                    && path_only.as_bytes()[sub.path.len()] == b'/')
+            {
                 let remainder = &req_path_and_query[sub.path.len()..];
                 return format!(
                     "{}{}{}",
@@ -225,6 +231,33 @@ mod tests {
         assert_eq!(
             cfg.resolve_upstream("/api/v1/users?page=1"),
             "https://api.example.com/v1/users?page=1"
+        );
+    }
+
+    #[test]
+    fn test_boundary_no_partial_prefix() {
+        let cfg = make_config();
+        // "/apix" must NOT match sub.path "/api" (exact boundary semantics)
+        assert_eq!(cfg.resolve_upstream("/apix"), "https://example.kr/apix");
+        assert_eq!(
+            cfg.resolve_upstream("/assetsx/y"),
+            "https://example.kr/assetsx/y"
+        );
+    }
+
+    #[test]
+    fn test_root_path_goes_to_default() {
+        let cfg = make_config();
+        assert_eq!(cfg.resolve_upstream("/"), "https://example.kr/");
+        assert_eq!(cfg.resolve_upstream("/?q=1"), "https://example.kr/?q=1");
+    }
+
+    #[test]
+    fn test_exact_sub_path_with_query() {
+        let cfg = make_config();
+        assert_eq!(
+            cfg.resolve_upstream("/api?x=1"),
+            "https://api.example.com?x=1"
         );
     }
 

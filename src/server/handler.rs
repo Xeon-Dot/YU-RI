@@ -89,11 +89,15 @@ pub async fn handle(
 
     stats.misses.fetch_add(1, Ordering::Relaxed);
 
+    let mut flight = None;
     if !is_head
         && range_request.is_none()
         && let Some(resp) = try_coalesced_hit(
             &shared,
             &final_cache_key,
+            &mut flight,
+            &if_none_match,
+            if_modified_since,
             range_request,
             &method,
             &path,
@@ -110,6 +114,7 @@ pub async fn handle(
         shared,
         upstream_url,
         final_cache_key,
+        flight,
         range_request,
         is_head,
         &method,
@@ -245,6 +250,20 @@ fn parse_entity_tag(tag: &str) -> &str {
         .unwrap_or(rest)
 }
 
+struct RefreshGuard {
+    shared: SharedState,
+    key: String,
+}
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        self.shared
+            .refresh_inflight
+            .lock()
+            .unwrap()
+            .remove(&self.key);
+    }
+}
+
 fn trigger_background_refresh(shared: &SharedState, cache_key: String) {
     if !shared
         .refresh_inflight
@@ -254,16 +273,43 @@ fn trigger_background_refresh(shared: &SharedState, cache_key: String) {
     {
         return;
     }
-    let s = shared.clone();
+    let guard = RefreshGuard {
+        shared: shared.clone(),
+        key: cache_key.clone(),
+    };
     tokio::spawn(async move {
-        let _ = background_refresh(cache_key.clone(), &s.config, &s.cache, &s.client).await;
-        s.refresh_inflight.lock().unwrap().remove(&cache_key);
+        let s = &guard.shared;
+        let _ = background_refresh(cache_key, &s.config, &s.cache, &s.client).await;
+        drop(guard);
     });
 }
 
+// Only the owning leader may remove its flight; Drop also handles cancellation.
+struct FlightGuard {
+    shared: SharedState,
+    key: String,
+    sender: broadcast::Sender<()>,
+}
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        let mut map = self.shared.inflight.lock().unwrap();
+        if map
+            .get(&self.key)
+            .is_some_and(|tx| tx.same_channel(&self.sender))
+        {
+            map.remove(&self.key);
+            let _ = self.sender.send(());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn try_coalesced_hit(
     shared: &SharedState,
     final_cache_key: &str,
+    flight: &mut Option<FlightGuard>,
+    if_none_match: &Option<String>,
+    if_modified_since: Option<SystemTime>,
     range_request: Option<(u64, Option<u64>)>,
     method: &http::Method,
     path: &str,
@@ -276,16 +322,34 @@ async fn try_coalesced_hit(
             Some(tx.subscribe())
         } else {
             let (tx, _) = broadcast::channel::<()>(1);
+            *flight = Some(FlightGuard {
+                shared: shared.clone(),
+                key: final_cache_key.to_string(),
+                sender: tx.clone(),
+            });
             map.insert(final_cache_key.to_string(), tx);
             None
         }
     };
 
     let rx = rx.as_mut()?;
-    let _ = rx.recv().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await;
     let entry = shared.cache.get_file(final_cache_key).await.ok()??;
-    stats.hits.fetch_add(1, Ordering::Relaxed);
-    let resp = build_cached_response(&entry, range_request, CacheStatus::Hit, false);
+    stats.record_hit(entry.is_fresh);
+    let status = if entry.is_fresh {
+        CacheStatus::Hit
+    } else {
+        CacheStatus::Stale
+    };
+    let resp = if is_not_modified(&entry, if_none_match, if_modified_since) {
+        stats.not_modified.fetch_add(1, Ordering::Relaxed);
+        not_modified_response(&entry, status)
+    } else {
+        build_cached_response(&entry, range_request, status, false)
+    };
+    if !entry.is_fresh {
+        trigger_background_refresh(shared, final_cache_key.to_string());
+    }
     log_request(
         method,
         path,
@@ -303,6 +367,7 @@ async fn fetch_from_upstream(
     shared: SharedState,
     upstream_url: String,
     final_cache_key: String,
+    flight: Option<FlightGuard>,
     range_request: Option<(u64, Option<u64>)>,
     is_head: bool,
     method: &http::Method,
@@ -371,15 +436,16 @@ async fn fetch_from_upstream(
             add_cache_headers(resp.headers_mut(), CacheStatus::Miss, 0);
             copy_upstream_headers(resp.headers_mut(), &headers, true);
 
-            let should_cache_body =
-                decision.cacheable && status == StatusCode::OK && range_request.is_none() && !vary_all;
+            let should_cache_body = decision.cacheable
+                && status == StatusCode::OK
+                && range_request.is_none()
+                && !vary_all;
             let max_body_limit = max_cacheable_body_bytes(config) as u64;
-            let inflight_key = should_cache_body.then(|| final_cache_key.clone());
 
             let cache_cloned = cache.clone();
             let mut up_body = up_resp.into_body();
             let store_options = store_options_from_headers(&headers, &decision);
-            let shared_for_inflight = shared.clone();
+
             let method_for_log = method.clone();
             let path_for_log = path.to_string();
 
@@ -395,11 +461,7 @@ async fn fetch_from_upstream(
                 )
                 .await;
                 drop(tx);
-                if let Some(ref key) = inflight_key
-                    && let Some(done_tx) = shared_for_inflight.inflight.lock().unwrap().remove(key)
-                {
-                    let _ = done_tx.send(());
-                }
+                drop(flight);
                 info!(
                     method = %method_for_log,
                     path = %path_for_log,
@@ -413,9 +475,7 @@ async fn fetch_from_upstream(
             Ok(resp)
         }
         Err(err) => {
-            if let Some(tx) = shared.inflight.lock().unwrap().remove(&final_cache_key) {
-                let _ = tx.send(());
-            }
+            drop(flight);
             stats.errors.fetch_add(1, Ordering::Relaxed);
             warn!(error = ?err, method = %method, path = %path, "Upstream fetch failed");
             log_request(method, path, 502, "ERROR", false, start_time);
